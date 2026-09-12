@@ -171,8 +171,27 @@
 </div>
 
 <script>
-// YONGLAND -- single-screen platformer. Bert Yong must stomp 5 Mini Frauds, then the
-// Giant Fraud, inside the Etihad.
+// DONKEY YONG -- a chase across Manchester as a series of single-screen tributes to
+// classic games. One file, no build step, no network: it has to open by double-click.
+//
+// The whole game is this one script (invariant 1), and it reads top to bottom:
+//
+//   constants           physics, per-screen numbers, the Mode 7 camera, grids, palettes
+//   LEVELS              one descriptor per built screen: everything an engine reads
+//   menu, geometry      the alpha level select; bodyBox and headBox
+//   audio               synthesised, no files
+//   entities, state     makePlayer / makeMini / makeGiant, `game`, startLevel / finishLevel
+//   engine helpers      rows and traffic, the maze, gravity and platforms, the road and its
+//                       projection, ladders, rollers, the hammer
+//   shared rules        the gate, the shard (fraudFlees), Mini and Giant AI, contact,
+//                       killBert(), resolveEnding()
+//   update              one path per engine, dispatched by updatePlaying(); the splits
+//   backgrounds         one per screen, baked once to an offscreen canvas
+//   THE MANCUNIAN WAY   the landmark atlas, the route, and the road drawn every frame
+//   rendering           characters, the Mode 7 cast, HUD, hints, cards, render()
+//   loop, input, boot   the only code allowed to touch the DOM (invariant 4)
+//
+// CLAUDE.md holds the invariants; donkey-yong/HANDOVER.md explains every number.
 
 var CANVAS_WIDTH = 960;
 var CANVAS_HEIGHT = 640;
@@ -259,13 +278,8 @@ var HOP_TIME = 0.13;
 var HOP_X = 64;
 var LANE_SPAN_MARGIN = 200;  // wrap length past the screen, so spacing stays even
 var CROSS_GRACE = 1.2;       // after a crossing lands and he is sent back to the start
-// Frogger's clock, and the reason the game is not a patience exercise. Without it the
-// optimal play is to stand on the kerb until a lane is completely empty, which costs
-// nothing and is never wrong -- measured at 28-54% lane occupancy, that is most of the
-// time. 26s is roughly twice a brisk crossing.
-var CROSS_TIME = 26.0;
-// And each crossing is faster than the last, so three of them are three different
-// problems rather than the same one three times.
+// Each crossing is faster than the last, so three of them are three different problems
+// rather than the same one three times. (Its clock is the screen's `clock`, in LEVELS.)
 var CROSS_SPEEDUP = 1.18;
 
 // THE CONCOURSE. A 24x16 grid of 40px tiles. Turning happens at a tile centre, within a
@@ -463,6 +477,7 @@ var KART_FRAUD_PAL = { shell: '#da291c', trim: '#2a0b08', tyre: '#14161a', rim: 
 
 // The shard. Drawn, not photographed, so one path serves both the 20px pickup on a girder
 // and the 200px close-up.
+var SHARD_SET = 6;           // pieces of the trophy: one per screen that ends in the Fraud leaving
 var SHARD_W = 20;
 var SHARD_H = 26;
 var SHARD_FLASH = 0.35;      // white-out on the pickup, before the close-up
@@ -576,6 +591,16 @@ function tune(key, dflt) {
   return (t && t[key] !== undefined) ? t[key] : dflt;
 }
 
+// The screen's clock in seconds, or 0 on a screen without one. What kind of clock it is
+// lives in the same declaration: `per: 'crossing'` is Frogger's, a fresh clock for every
+// attempt, restarted by a death or a landed crossing; `per: 'screen'` is the kart's, one
+// clock for the whole screen that runs through deaths and restarts only by running out.
+// `show` is how the HUD draws it, 'bar' or 'number'. Two screens used to express this two
+// different ways, one of them outside the manifest; it is one field now, on every screen.
+function clockSecs() {
+  return level.clock ? level.clock.secs : 0;
+}
+
 // --- Levels. Every screen is a descriptor and the engine reads the current one out of
 // --- `level`; nothing below may reach for level-1 data directly. DESIGN.md carries the
 // --- full roster and the per-level mechanics manifest, including which fields are
@@ -589,8 +614,9 @@ var LEVELS = [{
   engine: 'platform',
   world: { w: 960, h: 640 },
   groundY: 600,
-  // null means a solid floor across the whole world. An array of {x, w} segments makes
-  // pits; nothing uses that yet -- see DESIGN.md, THE CROSSING.
+  // null means a solid floor across the whole world. An array of {x, w, y} segments makes
+  // pits -- no screen has one yet, and falling out of the world is still not a death on
+  // the platformer (FOUNDATIONS.md, seam 3.3).
   ground: null,
   platforms: [
     { x: 70,  y: 480, width: 240, height: 14 },
@@ -620,12 +646,12 @@ var LEVELS = [{
   },
   powerups: null,                 // deliberate: it's the tutorial, the verb is the lesson
   collectible: null,              // TODO -- the hidden extra life
-  // Declared, but nothing drops it yet: the prologue's ending is still the shipped one,
-  // and the shatter is its own stage (DESIGN.md). When that lands, the only wiring needed
-  // is fraudFlees() on the third hit -- the drop, the pickup, the flash and the close-up
-  // all come from this declaration.
+  // Out of the middle of the trophy: the third stomp meets the gate, gateBoss() runs the
+  // beat, and shatterTrophy() calls fraudFlees() with the burst's centre. The drop, the
+  // pickup, the flash and the close-up all come from this declaration.
   shard: { n: 1, from: 'boss', at: null, fall: true, copy: 'A PIECE OF THE TROPHY' },
   tuning: null,                   // deliberate: the shipped values are the baseline
+  clock: null,                    // deliberate: the tutorial is not against the clock
   background: drawEtihad,
   hud: { label: 'FRAUDS' },
   copy: {
@@ -718,6 +744,7 @@ var LEVELS = [{
     solidPlatforms: true, rollerInterval: 4.2,
     respawnAtDeath: true          // a four-girder climb is too long to redo for one hit
   },
+  clock: null,                    // deliberate: the footballs are the pressure
   background: drawScaffold,
   hud: { label: null },           // deliberate: no quota to count
   copy: {
@@ -789,6 +816,12 @@ var LEVELS = [{
   // land it with, so it sits where he was standing.
   shard: { n: 3, from: 'boss', at: null, fall: false, copy: 'A PIECE OF THE TROPHY' },
   tuning: null,
+  // Frogger's clock, and the reason the screen is not a patience exercise. Without it the
+  // optimal play is to stand on the kerb until a lane is completely empty, which costs
+  // nothing and is never wrong -- measured at 28-54% lane occupancy, that is most of the
+  // time. 26s is roughly twice a brisk crossing. One per ATTEMPT: a death or a landed
+  // crossing starts it again. A bar under the tally, because it is glanced at, not read.
+  clock: { secs: 26, per: 'crossing', show: 'bar' },
   background: drawCrossing,
   hud: { label: 'CROSSED', kind: 'boss-hits' },
   copy: {
@@ -884,7 +917,7 @@ var LEVELS = [{
       //
       // which is 94 seconds at cruise and 64 flat out on the boost. The number was set by
       // the level's length, not by the footage: a road has to be at least ninety seconds
-      // long to be a level rather than a demo (MANCUNIAN-PLAN.md, Part 1), and the harness
+      // long to be a level rather than a demo (HANDOVER.md, decision record), and the harness
       // asserts that floor. Landmarks then arrive about every four seconds, which is also
       // what the real drive does. Every z below is its footage time times 424.
       //
@@ -982,7 +1015,7 @@ var LEVELS = [{
   // dodges cost; the fifth goes down somewhere past the MMU block and the Giant cuts in,
   // which leaves the fight half the clock. makeMini() jitters each one's speed by +-18% off
   // tuning.miniSpeed, so they string out further on their own. The bot's splits are what
-  // set these, and MANCUNIAN-PLAN.md Part 2 has the derivation.
+  // set these; HANDOVER.md (The Minis evade) has the derivation.
   enemies: { form: 'miniKart', at: [
     { roadX: -150, z: 1400 }, { roadX:  180, z: 3000 },
     { roadX:  -60, z: 4600 }, { roadX:  260, z: 6200 },
@@ -1028,12 +1061,13 @@ var LEVELS = [{
   // Slower than Bert cruises, so every one of them is catchable without a boost, and slow
   // enough that the +-18% jitter never produces one he cannot close on at all.
   tuning: { miniSpeed: 430 },
-  // Ninety seconds to meet the gate. Runs through deaths, stops for the ending. At zero
-  // a life goes and the clock resets -- not a hard game over: lives carry across screens,
-  // and a bank earned on the Scaffold is not thrown away by one slow drive. The road is
-  // 94 seconds at cruise, so the viaduct is reachable only on the boost and the fight is
-  // expected to end around the cutting. That is the pressure.
-  clock: 90,
+  // Ninety seconds to meet the gate. One per SCREEN: it runs through deaths and stops for
+  // the ending. At zero a life goes and the clock resets -- not a hard game over: lives
+  // carry across screens, and a bank earned on the Scaffold is not thrown away by one slow
+  // drive. The road is 94 seconds at cruise, so the viaduct is reachable only on the boost
+  // and the fight is expected to end around the cutting. That is the pressure. A number,
+  // top right, because the player is doing arithmetic against it.
+  clock: { secs: 90, per: 'screen', show: 'number' },
   background: drawMancunian,
   hud: { label: 'FRAUDS', kind: 'boss-hits' },
   copy: {
@@ -1043,9 +1077,9 @@ var LEVELS = [{
   }
 }, {
   // --- 5 / THE CONCOURSE. Pac-Man, under Old Trafford. The second top-down mode: a maze
-  // --- and continuous movement rather than rows and hops. Screens 3 and 4 are not built,
-  // --- and the chain simply skips them -- `screen` is the roster number, the array index
-  // --- is the build order, and they are allowed to differ.
+  // --- and continuous movement rather than rows and hops. Screen 4 is not built, and the
+  // --- chain simply skips it -- `screen` is the roster number, the array index is the
+  // --- build order, and they are allowed to differ.
   id: 'concourse',
   screen: 5,
   name: 'THE CONCOURSE',
@@ -1104,6 +1138,7 @@ var LEVELS = [{
   collectible: null,              // TODO -- the hidden extra life
   shard: { n: 6, from: 'boss', at: null, fall: false, copy: 'THE LAST PIECE' },
   tuning: null,
+  clock: null,                    // deliberate: the power timer is the only clock here
   background: drawConcourse,
   hud: { label: 'FRAUDS', kind: null },
   copy: {
@@ -1137,8 +1172,8 @@ var MENU = [{ label: 'FULL RUN', sub: 'from the prologue, lives carry over', kin
 (function () {
   for (var i = 0; i < LEVELS.length; i++) {
     MENU.push({
-      // The roster number, not the array index: screens 3 and 4 are not built and the
-      // chain skips them, so the two stopped being the same thing at the Concourse.
+      // The roster number, not the array index: screen 4 is not built and the chain
+      // skips it, so the two stopped being the same thing at the Concourse.
       label: LEVELS[i].screen + '   ' + LEVELS[i].name,
       sub: (LEVELS[i].subtitle || '').toLowerCase(),
       kind: 'level', level: i
@@ -1232,10 +1267,9 @@ var sfx = {
 
 // --- Entities
 
-// The player's form and spawn come from the level: each screen transforms Bert into
-// whatever survives it. See DESIGN.md -- the shard is what changes him.
 // --- Rows, for the top-down engine. A row is a band across the screen; Bert is always in
-// --- exactly one, and hopping is what changes it.
+// --- exactly one, and hopping is what changes it. They come first because a spawn can be
+// --- declared by row, and makePlayer() has to turn that into a position.
 
 function levelRows() {
   return (level.map && level.map.rows) || null;
@@ -1250,6 +1284,8 @@ function rowTop(i, bodyH) {
   return r.y + r.h - bodyH - 6;
 }
 
+// The player's form and spawn come from the level: each screen transforms Bert into
+// whatever survives it. See DESIGN.md -- the shard is what changes him.
 function makePlayer() {
   var def = CHAR_DEFS[level.player.form];
   var sp = level.player.spawn;
@@ -1348,7 +1384,8 @@ var game = {
   pickups: [],
   shard: null,
   shardTimer: 0,
-  crossTimer: 0,
+  // The level clock, on a screen that declares one, counting down. See clockSecs().
+  levelClock: 0,
   trophyBits: [],
   traffic: [],
   pellets: [],
@@ -1362,6 +1399,8 @@ var game = {
   boxIndex: 0,
   // The scripted ending, or null while the screen is still a driving game.
   plunge: null,
+  // The screen's hidden extra life has been taken. Once a screen, not once a lap.
+  lifeTaken: false,
   // Hint text: set from the level or from a pickup, ticked down here, worded nowhere but
   // in the data. update() never touches the DOM (invariant 4), so this is plain state.
   hint: null,
@@ -1382,7 +1421,14 @@ var game = {
   // startLevel() -- you turn it on once and it stays on across restarts and screens,
   // which is the entire point of it. Every death in the game goes through killBert(),
   // so that is the only place it has to be honoured.
-  invuln: false
+  invuln: false,
+  // Alpha testing aid, and like `invuln` never reset by a new run: the T key shows the
+  // splits strip. The splits themselves are recorded whether or not anyone is looking.
+  splitsOn: false,
+  // level-scoped, and written only by resetSplits() and watchSplits() -- see there
+  splits: [],
+  levelTime: 0,
+  splitWatch: null
 };
 var bert = makePlayer();
 var keys = {};
@@ -1453,9 +1499,8 @@ function startLevel(i) {
   game.boxNext = 0;
   game.boxIndex = 0;
   game.plunge = null;
-  game.levelClock = level.clock ? tune('clock', level.clock) : 0;
+  game.levelClock = clockSecs();
   game.lifeTaken = false;
-  game.crossTimer = tune('crossTime', CROSS_TIME);
   game.hint = null;
   game.hintTimer = 0;
   if (level.powerups) {
@@ -1478,6 +1523,7 @@ function startLevel(i) {
   bert = makePlayer();
   // A boss that is present from the start is the goal, not a reward for clearing the screen.
   if (level.boss && level.boss.atStart) spawnGiant(true);
+  resetSplits();                        // after the spawns: what is there at load is not a split
   restartBtn.style.display = 'none';
 
   // A screen with no intro copy goes straight in -- the prologue's START panel already
@@ -1607,7 +1653,7 @@ function resetFrog() {
   bert.x = level.player.spawn.x;
   bert.y = rowTop(bert.row, b.h);
   bert.hopT = 0;
-  game.crossTimer = tune('crossTime', CROSS_TIME);
+  game.levelClock = clockSecs();        // a new attempt, so Frogger's clock starts again
 }
 
 // A crossing lands. Arriving IS the verb on this screen, so it is what gates him.
@@ -2206,9 +2252,6 @@ function smashMini(m) {
   sfx.stomp();
 }
 
-// One swing of the big hammer and he is gone. He still cannot be fought -- boss.hits is
-// 0 and always will be on this screen -- he just cannot stand there either. What he
-// leaves behind is the point: DESIGN.md, shard 2 of 6.
 // --- The Fraud leaves, and leaves a shard. This is the spine of the whole game (see
 // --- DESIGN.md), so it is one path, not one per screen.
 // ---
@@ -2696,11 +2739,12 @@ function integrateEscape(e, dt) {
 function objectiveMet() {
   var o = level.objective;
   if (!o || bert.dying) return false;
-  // 'reach' -- stand in the zone. No screen uses it today; THE CROSSING will.
-  if (o.kind === 'reach') return overlaps(bodyOf(bert), o.rect);
-  // 'shard' -- the screen is not over when he flees, it is over when Bert has the piece.
+  // 'shard' -- every built screen. The screen is not over when he flees; it is over when
+  // Bert has the piece.
   if (o.kind === 'shard') return !!(game.shard && game.shard.taken);
-  // 'clear-frauds' is resolved by the boss dying in the contact handler, not here.
+  // 'reach' -- stand in a zone. Implemented and unused: kept for an ending that is a place
+  // rather than a piece, which the finale may yet want.
+  if (o.kind === 'reach') return overlaps(bodyOf(bert), o.rect);
   return false;
 }
 
@@ -2805,10 +2849,17 @@ function updateCrossing(dt) {
   // The clock. It runs only while a crossing is live -- once he has fled there is nothing
   // left to be late for, and being timed out while walking to the shard would be absurd.
   if (!bert.dying && !game.shard && game.victoryTimer <= 0) {
-    game.crossTimer -= dt;
-    if (game.crossTimer <= 0) {
-      game.crossTimer = 0;
-      if (bert.invincible <= 0) { killBert(); return; }
+    game.levelClock -= dt;
+    if (game.levelClock <= 0) {
+      game.levelClock = 0;
+      if (bert.invincible <= 0) {
+        killBert();
+        if (bert.dying) return;
+        // Refused: the alpha invulnerability toggle is on. Start the attempt's clock again,
+        // as a respawn would have -- left at zero, this returned every frame before the hop
+        // below, and the frog froze for good.
+        game.levelClock = clockSecs();
+      }
     }
   }
   for (var i = 0; i < game.frauds.length; i++) {
@@ -2952,7 +3003,7 @@ function updateMancunian(dt) {
   if (game.plunge) {
     updatePlunge(dt);
     projectPlunge();
-    if (resolveEnding(dt)) return;
+    resolveEnding(dt);
     return;
   }
 
@@ -2987,7 +3038,7 @@ function tickClock(dt) {
   if (!level.clock || game.plunge) return;
   game.levelClock -= dt;
   if (game.levelClock > 0) return;
-  game.levelClock = tune('clock', level.clock);
+  game.levelClock = clockSecs();
   if (game.state === STATE.PLAYING) {
     showHint(HINTS.clock);
     kartFalls();
@@ -3403,14 +3454,21 @@ function projectPlunge() {
   pl.gyNow = pl.gy + pl.gvy * pl.t + 0.5 * PLUNGE_G * pl.t * pl.t;
 }
 
+// Engines are separate update paths, not flags inside one: a top-down screen shares the
+// shell and none of the physics, and mixing them is how both end up fragile.
 function updatePlaying(dt) {
-  if (level.engine === 'maze') { updateConcourse(dt); return; }
-  // Engines are separate update paths, not flags inside one: a top-down screen shares the
-  // shell and none of the physics, and mixing them is how both end up fragile.
-  if (level.engine === 'topdown') { updateCrossing(dt); return; }
-  if (level.engine === 'mode7') { updateMancunian(dt); return; }
-  // The run clock only ticks here, so intro and complete cards, the respawn hold and the
-  // portrait pause (which stops update() entirely) are all excluded without extra logic.
+  if (level.engine === 'maze') updateConcourse(dt);
+  else if (level.engine === 'topdown') updateCrossing(dt);
+  else if (level.engine === 'mode7') updateMancunian(dt);
+  else updatePlatformer(dt);
+}
+
+// The platformer: the prologue and THE SCAFFOLD. Gravity, one-way or solid platforms,
+// ladders, the swing, and the two-box contact model.
+function updatePlatformer(dt) {
+  // The run clock ticks only inside an engine's update, as it does in the other three, so
+  // intro and complete cards, the respawn hold and the portrait pause (which stops
+  // update() entirely) are all excluded without extra logic.
   game.runTime += dt;
 
   // Bert input
@@ -3461,6 +3519,9 @@ function updatePlaying(dt) {
       if (sf.dying || sf.escaping || !overlaps(sb, bodyOf(sf))) continue;
       if (sf.type === 'mini') smashMini(sf);
       else if (bert.swingBig && level.boss.routedBy === 'bighammer') {
+        // One swing of the big hammer and he is gone. He still cannot be fought -- boss.hits
+        // is 0 and always will be on this screen -- he just cannot stand there either. What
+        // he leaves behind is the point: DESIGN.md, shard 2 of 6.
         bert.bigHammer = 0;
         bert.carriedFrom = null;
         sfx.giantHit();
@@ -3604,7 +3665,9 @@ function updateRespawning(dt) {
         bert.vy = 0;
         projectCast();
       }
-      game.crossTimer = tune('crossTime', CROSS_TIME);
+      // An attempt-long clock starts again with the attempt; a screen-long one does not,
+      // because on that screen a death is meant to cost its seconds.
+      if (level.clock && level.clock.per === 'crossing') game.levelClock = clockSecs();
       bert.hammer = 0; bert.bigHammer = 0; bert.swing = 0; bert.carriedFrom = null;
       bert.invincible = POST_RESPAWN_INVULN;
       game.state = STATE.PLAYING;
@@ -3633,6 +3696,53 @@ function update(dt) {
   else if (game.state === STATE.LEVEL_INTRO) updateLevelIntro(dt);
   else if (game.state === STATE.LEVEL_COMPLETE) updateLevelComplete(dt);
   else if (game.state === STATE.SHARD) updateShardCard(dt);
+  watchSplits(dt);
+}
+
+// --- Splits: the moments a screen is made of, stamped with the time into it. The harness's
+// --- bot prints them for THE MANCUNIAN WAY, and the human run it cannot stand in for reads
+// --- its own against them (donkey-yong/NEXT.md). Observational only: watchSplits() reads
+// --- the state after each frame and writes nothing back but the splits, so no split can
+// --- change how a screen plays -- and the trace confirms that, frame for frame.
+
+function resetSplits() {
+  game.splits = [];
+  game.levelTime = 0;
+  game.splitWatch = {
+    lives: game.lives, minis: game.minisLeft, minis0: game.minisLeft,
+    giant: game.giantSpawned, hits: 0, gate: false, state: game.state
+  };
+}
+
+function watchSplits(dt) {
+  var w = game.splitWatch;
+  if (!w) return;
+  var st = game.state, g = game.giant;
+  // Time into the screen, playing and respawning -- what a stopwatch would say. Not the
+  // cards, which last the same whoever is playing.
+  if (st === STATE.PLAYING || st === STATE.RESPAWNING) game.levelTime += dt;
+  var mark = function (label) { game.splits.push({ label: label, t: game.levelTime }); };
+  if (game.lives < w.lives) mark('died');
+  else if (game.lives > w.lives) mark('+life');
+  if (game.minisLeft < w.minis) mark('m' + (w.minis0 - game.minisLeft));
+  if (game.giantSpawned && !w.giant) mark('G');
+  if (g && g.hitsTaken > w.hits) { w.hits = g.hitsTaken; mark('h' + g.hitsTaken); }
+  var gated = !!(game.plunge || (g && (g.escaping || g.trophyTimer > 0)));
+  if (gated && !w.gate) { w.gate = true; mark('gate'); }
+  if (st !== w.state && (st === STATE.SHARD || st === STATE.GAME_OVER)) {
+    mark(st === STATE.SHARD ? 'shard' : 'over');
+    // Printed as well as drawn, so three runs can be pasted beside the bot's three.
+    if (game.splitsOn) console.log('SPLITS  ' + level.id + '  ' + splitsLine());
+  }
+  w.lives = game.lives; w.minis = game.minisLeft; w.giant = game.giantSpawned; w.state = st;
+}
+
+function splitsLine() {
+  var out = [];
+  for (var i = 0; i < game.splits.length; i++) {
+    out.push(game.splits[i].label + ' ' + game.splits[i].t.toFixed(1));
+  }
+  return out.join('  ');
 }
 
 // --- Background, built once to an offscreen canvas and blitted each frame.
@@ -5132,16 +5242,28 @@ function drawRoad() {
 var LAMP_SPACING_M = 26;
 var LAMP_H_M = 11;
 
+// Where a lamp column stands at z, in road space, or null where there is none. Beside the
+// deck edge on both sides -- except over the unfinished slip road, which was never lit. A
+// column there stood in the drivable surface and was driven straight through, and it was
+// the one thing on this screen that could be at Bert's own x, nearer than him, and so be
+// drawn behind him (the cast is drawn after the road).
+function lampX(z, side) {
+  if (side > 0 && slipWidth(z) > 0) return null;
+  return roadCentre(z) + side * (ROAD_HALF + 1.6 * UNITS_PER_M);
+}
+
 function drawLampAt(z, side, camX) {
   var dz = z - game.camZ;
   if (dz < 60) return;
+  var lx = lampX(z, side);
+  if (lx === null) return;
   var s = CAM_DEPTH / dz;
   var sy = HORIZON_Y + CAM_H * s;
   if (sy > CANVAS_HEIGHT + 60) return;
   var h = LAMP_H_M * UNITS_PER_M * s;
   if (h < 3) return;
   var w = Math.max(1, 0.5 * UNITS_PER_M * s);
-  var x = WORLD_W / 2 + (roadCentre(z) + side * (ROAD_HALF + 1.6 * UNITS_PER_M) - camX) * s;
+  var x = WORLD_W / 2 + (lx - camX) * s;
   var top = sy - h;
   ctx.fillStyle = '#4e555f';
   ctx.fillRect(x - w / 2, top, w, h);
@@ -5570,7 +5692,9 @@ function drawMode7Cast() {
       // gets. A cooldown you cannot see is a button that feels broken.
       if (bert.boost > 0) {
         ctx.save();
-        ctx.globalAlpha = 0.55 + Math.random() * 0.35;
+        // Flickered off the run clock, not Math.random: a draw path must never roll the
+        // dice gameplay rolls, or what is drawn this frame shifts what spawns next.
+        ctx.globalAlpha = 0.55 + 0.35 * (0.5 + 0.5 * Math.sin(game.runTime * 57));
         ctx.fillStyle = '#ff9a2a';
         ctx.fillRect(p.x - 26, p.y - 6, 12, 10);
         ctx.fillRect(p.x + 14, p.y - 6, 12, 10);
@@ -6034,7 +6158,7 @@ function drawHUD() {
   ctx.font = 'bold 20px "Courier New", monospace';
   ctx.fillStyle = '#ffffff';
   ctx.fillText(level.name, 24, 20);
-  if (level.clock) drawClock();
+  if (level.clock && level.clock.show === 'number') drawClock();
 
   // Five icons run from x=24 at a 26px pitch and end at 150; the label starts at 158, so a
   // sixth would collide. Past five, one icon and a count.
@@ -6074,14 +6198,12 @@ function drawHUD() {
     ctx.fillText(level.hud.label + ': ' + tally, 158, 44);
   }
 
-  // Armed. The bar is the ordinary hammer burning down; the big one has no timer, so it
-  // gets a word instead -- an empty bar there would read as "about to run out".
-  // Second row, right of the lives: the top line is the level name, which on a 12-letter
-  // screen already runs to x=168.
-  // One bar per screen, under the tally, so it never needs a word of its own: on the
-  // Crossing it is the clock, in the maze it is the power. Colour carries the urgency.
-  if (level.engine === 'topdown') {
-    var frac = Math.max(0, game.crossTimer / tune('crossTime', CROSS_TIME));
+  // One bar per screen, second row under the tally -- the top line is the level name,
+  // which on a 12-letter screen already runs to x=168 -- so it never needs a word of its
+  // own: a declared bar clock, the power in the maze, the boost on the road, the hammer on
+  // the Scaffold. Colour carries the urgency.
+  if (level.clock && level.clock.show === 'bar') {
+    var frac = Math.max(0, game.levelClock / level.clock.secs);
     ctx.fillStyle = 'rgba(255,255,255,0.22)';
     ctx.fillRect(158, 62, 88, 9);
     // Red in the last quarter: a clock you cannot see running out is just an ambush.
@@ -6117,6 +6239,8 @@ function drawHUD() {
       ctx.fillText('DOWN TO THROW', 174, 76);
     }
   } else if (bert.bigHammer > 0) {
+    // Armed. The bar is the ordinary hammer burning down; the big one has no timer, so it
+    // gets a word instead -- an empty bar there would read as "about to run out".
     drawHammer(160, 46, 14, 20);
     ctx.font = 'bold 13px "Courier New", monospace';
     ctx.fillStyle = '#ffe07a';
@@ -6146,6 +6270,23 @@ function drawHint() {
   ctx.fillRect(CANVAS_WIDTH / 2 - tw / 2 - 16, 96, tw + 32, 30);
   ctx.fillStyle = '#ffe07a';
   ctx.fillText(game.hint, CANVAS_WIDTH / 2, 112);
+  ctx.restore();
+}
+
+// The splits strip, along the bottom edge: time into the screen, then every split so far.
+// When they outgrow the line the newest are kept, because the tail is what you are
+// watching during a run. The T key turns it on; see watchSplits().
+function drawSplits() {
+  var tail = splitsLine();
+  if (tail.length > 116) tail = '...' + tail.slice(tail.length - 113);
+  ctx.save();
+  ctx.fillStyle = 'rgba(4,10,22,0.82)';
+  ctx.fillRect(0, CANVAS_HEIGHT - 22, CANVAS_WIDTH, 22);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 12px "Courier New", monospace';
+  ctx.fillStyle = '#7cfc9a';
+  ctx.fillText('t ' + game.levelTime.toFixed(1) + '   ' + tail, 10, CANVAS_HEIGHT - 11);
   ctx.restore();
 }
 
@@ -6200,19 +6341,17 @@ function drawShardCard() {
   ctx.fillText(level.shard.copy || 'A PIECE OF THE TROPHY', cx, 96);
   ctx.font = 'bold 22px "Courier New", monospace';
   ctx.fillStyle = '#e8c14a';
-  ctx.fillText('SHARD ' + level.shard.n + ' OF 6', cx, 136);
+  ctx.fillText('SHARD ' + level.shard.n + ' OF ' + SHARD_SET, cx, 136);
 }
 
-// Laid out from a real running total. The original stepped by `i * (sizes[i] + 18)`,
-// which uses the CURRENT line's size to space every line before it -- fine while the
-// first line was always the largest, but a 56px title followed by a 24px subtitle put the
-// subtitle on top of the title. Empty strings are skipped so an absent subtitle leaves no
-// hole.
 // Row geometry, shared by drawMenu() and the click hit-test. The hit box is the full row
 // pitch rather than the drawn box: the drawn box is 46 logical px, which on a landscape
 // phone is only about 28 CSS px tall -- under any sane tap target.
 var MENU_TOP = 196;
-var MENU_PITCH = 58;
+// 58 while that fits, and less once it does not: the footer's two lines have to land on
+// the canvas under the last row. The seventh row pushed the controls line to y=654 on a
+// 640 canvas, and nothing said so. An eighth row squeezes to 47; a ninth wants columns.
+var MENU_PITCH = Math.min(58, Math.floor((CANVAS_HEIGHT - 12 - 52 - MENU_TOP) / MENU.length));
 function menuRowRect(i, forHit) {
   var h = forHit ? MENU_PITCH : 46;
   return { x: 210, y: MENU_TOP + i * MENU_PITCH - h / 2, w: 540, h: h };
@@ -6237,7 +6376,7 @@ function drawMenu() {
   ctx.fillText('DONKEY YONG', CANVAS_WIDTH / 2, 86);
   ctx.font = 'bold 14px "Courier New", monospace';
   ctx.fillStyle = '#7f93ab';
-  ctx.fillText('ALPHA BUILD  \u00B7  ' + LEVELS.length + ' OF 7 SCREENS BUILT',
+  ctx.fillText('ALPHA BUILD  \u00B7  ' + LEVELS.length + ' OF ' + ROSTER + ' SCREENS BUILT',
     CANVAS_WIDTH / 2, 128);
 
   for (var i = 0; i < MENU.length; i++) {
@@ -6295,6 +6434,11 @@ function drawMenu() {
     CANVAS_WIDTH / 2, footY + 30);
 }
 
+// Laid out from a real running total. The original stepped by `i * (sizes[i] + 18)`,
+// which uses the CURRENT line's size to space every line before it -- fine while the
+// first line was always the largest, but a 56px title followed by a 24px subtitle put the
+// subtitle on top of the title. Empty strings are skipped so an absent subtitle leaves no
+// hole.
 function panel(lines, colors, sizes) {
   ctx.fillStyle = 'rgba(4,10,22,0.82)';
   ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
@@ -6371,15 +6515,17 @@ function render() {
   } else if (game.state === STATE.SHARD) {
     drawShardCard();
   } else if (game.state === STATE.LEVEL_INTRO) {
+    // The roster number, never the array index: the two part company at the Concourse, and
+    // this card used to say LEVEL 4 over a screen the level select calls 5.
     panel(
-      ['LEVEL ' + game.levelIndex, level.name, level.subtitle || ''],
+      ['LEVEL ' + level.screen, level.name, level.subtitle || ''],
       ['#a8d4ef', '#6cabdd', '#a8d4ef'],
       [22, 52, 20]
     );
   } else if (game.state === STATE.LEVEL_COMPLETE) {
     panel(
       [(level.copy && level.copy.complete) || (level.name + ' CLEARED'),
-       level.shard ? 'SHARD ' + level.shard.n + ' OF 6' : ''],
+       level.shard ? 'SHARD ' + level.shard.n + ' OF ' + SHARD_SET : ''],
       ['#6cabdd', '#ffffff'],
       [44, 24]
     );
@@ -6392,6 +6538,9 @@ function render() {
       [56, 48]
     );
   }
+
+  // Over everything, the cards included: the level-complete card is when splits are read.
+  if (game.splitsOn && game.state !== STATE.START) drawSplits();
 }
 
 // --- Loop
@@ -6444,6 +6593,7 @@ window.addEventListener('keydown', function (e) {
   if (e.code === 'Space' && !e.repeat) pressJump();
   if (e.code === 'KeyM') { muted = !muted; }
   if (e.code === 'KeyI' && !e.repeat) { game.invuln = !game.invuln; }
+  if (e.code === 'KeyT' && !e.repeat) { game.splitsOn = !game.splitsOn; }
 });
 window.addEventListener('keyup', function (e) {
   if (e.code === 'ArrowLeft') keys.left = false;
