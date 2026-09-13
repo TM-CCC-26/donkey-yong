@@ -189,7 +189,7 @@
 //   backgrounds         one per screen, baked once to an offscreen canvas
 //   THE MANCUNIAN WAY   the landmark atlas, the route, and the road drawn every frame
 //   rendering           characters, the Mode 7 cast, HUD, hints, cards, render()
-//   loop, input, boot   the only code allowed to touch the DOM (invariant 4)
+//   loop, input, boot   the only code allowed to touch the DOM or storage (invariant 4)
 //
 // CLAUDE.md holds the invariants; donkey-yong/HANDOVER.md explains every number.
 
@@ -1428,7 +1428,15 @@ var game = {
   // level-scoped, and written only by resetSplits() and watchSplits() -- see there
   splits: [],
   levelTime: 0,
-  splitWatch: null
+  splitWatch: null,
+  // ...and the lines of the screens already finished, oldest first, which outlive the run
+  // and the page: see keepSplits(). update() only appends and flags them; loop() saves
+  // them, because storage belongs to the browser side (invariant 4).
+  splitsLog: [],
+  splitsDirty: false,
+  // what C last did, said in the strip for a moment -- set by the input layer
+  splitsNote: '',
+  splitsNoteTimer: 0
 };
 var bert = makePlayer();
 var keys = {};
@@ -1546,6 +1554,7 @@ function resetGame(startAt, practice) {
 
 function toMenu() {
   restartBtn.style.display = 'none';
+  game.bannerTimer = 0;       // Esc can leave mid-banner, and nothing counts it down here
   game.state = STATE.START;
 }
 
@@ -3697,6 +3706,7 @@ function update(dt) {
   else if (game.state === STATE.LEVEL_COMPLETE) updateLevelComplete(dt);
   else if (game.state === STATE.SHARD) updateShardCard(dt);
   watchSplits(dt);
+  if (game.splitsNoteTimer > 0) game.splitsNoteTimer -= dt;
 }
 
 // --- Splits: the moments a screen is made of, stamped with the time into it. The harness's
@@ -3710,7 +3720,7 @@ function resetSplits() {
   game.levelTime = 0;
   game.splitWatch = {
     lives: game.lives, minis: game.minisLeft, minis0: game.minisLeft,
-    giant: game.giantSpawned, hits: 0, gate: false, state: game.state
+    giant: game.giantSpawned, hits: 0, gate: false, state: game.state, invuln: game.invuln
   };
 }
 
@@ -3729,12 +3739,29 @@ function watchSplits(dt) {
   if (g && g.hitsTaken > w.hits) { w.hits = g.hitsTaken; mark('h' + g.hitsTaken); }
   var gated = !!(game.plunge || (g && (g.escaping || g.trophyTimer > 0)));
   if (gated && !w.gate) { w.gate = true; mark('gate'); }
+  if (game.invuln) w.invuln = true;     // for any part of the screen, not only its end
   if (st !== w.state && (st === STATE.SHARD || st === STATE.GAME_OVER)) {
     mark(st === STATE.SHARD ? 'shard' : 'over');
-    // Printed as well as drawn, so three runs can be pasted beside the bot's three.
-    if (game.splitsOn) console.log('SPLITS  ' + level.id + '  ' + splitsLine());
+    keepSplits(level.id + '  ' + splitsLine() + (w.invuln ? '  INVULNERABLE' : ''));
   }
   w.lives = game.lives; w.minis = game.minisLeft; w.giant = game.giantSpawned; w.state = st;
+}
+
+// A finished screen's line has to outlive the screen. The strip is drawn on the canvas, so
+// there is no text to select, and the next screen starts a new set a few seconds later --
+// which is how the first person to use it lost every line. Kept here, saved by loop(), and
+// copied by C. Stamped with the date and time because they outlast the page, and a screen
+// played invulnerable says so, because its times are not a real run's.
+var SPLITS_KEEP = 12;       // the gate's three drives and two rounds of the other four
+function keepSplits(line) {
+  var d = new Date();
+  var two = function (n) { return (n < 10 ? '0' : '') + n; };
+  var kept = d.getFullYear() + '-' + two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' ' +
+             two(d.getHours()) + ':' + two(d.getMinutes()) + '  ' + line;
+  game.splitsLog.push(kept);
+  if (game.splitsLog.length > SPLITS_KEEP) game.splitsLog.splice(0, game.splitsLog.length - SPLITS_KEEP);
+  game.splitsDirty = true;
+  if (game.splitsOn) console.log('SPLITS  ' + kept);    // for anyone with the console open
 }
 
 function splitsLine() {
@@ -6275,18 +6302,34 @@ function drawHint() {
 
 // The splits strip, along the bottom edge: time into the screen, then every split so far.
 // When they outgrow the line the newest are kept, because the tail is what you are
-// watching during a run. The T key turns it on; see watchSplits().
+// watching during a run. The T key turns it on; see watchSplits(). The same strip says
+// what C just did, whether or not T is on; and on the level select, where the controls
+// line holds the bottom edge, it moves to the top and says how many lines are kept.
 function drawSplits() {
-  var tail = splitsLine();
-  if (tail.length > 116) tail = '...' + tail.slice(tail.length - 113);
+  var note = game.splitsNoteTimer > 0 ? game.splitsNote : '';
+  var n = game.splitsLog.length;
+  if (game.state === STATE.START) {
+    if (!note && !n) return;
+    splitsStrip(note || ('SPLITS KEPT FROM ' + n + (n === 1 ? ' SCREEN' : ' SCREENS') +
+      '  ·  C COPIES THEM'), 0);
+  } else if (note) {
+    splitsStrip(note, CANVAS_HEIGHT - 22);
+  } else if (game.splitsOn) {
+    var tail = splitsLine();
+    if (tail.length > 116) tail = '...' + tail.slice(tail.length - 113);
+    splitsStrip('t ' + game.levelTime.toFixed(1) + '   ' + tail, CANVAS_HEIGHT - 22);
+  }
+}
+
+function splitsStrip(text, top) {
   ctx.save();
   ctx.fillStyle = 'rgba(4,10,22,0.82)';
-  ctx.fillRect(0, CANVAS_HEIGHT - 22, CANVAS_WIDTH, 22);
+  ctx.fillRect(0, top, CANVAS_WIDTH, 22);
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
   ctx.font = 'bold 12px "Courier New", monospace';
   ctx.fillStyle = '#7cfc9a';
-  ctx.fillText('t ' + game.levelTime.toFixed(1) + '   ' + tail, 10, CANVAS_HEIGHT - 11);
+  ctx.fillText(text, 10, top + 11);
   ctx.restore();
 }
 
@@ -6540,7 +6583,7 @@ function render() {
   }
 
   // Over everything, the cards included: the level-complete card is when splits are read.
-  if (game.splitsOn && game.state !== STATE.START) drawSplits();
+  drawSplits();
 }
 
 // --- Loop
@@ -6555,6 +6598,8 @@ function loop(ts) {
   // Portrait pauses the simulation but keeps rendering, so the frame behind the
   // rotate overlay stays current and nothing moves while the player turns the phone.
   if (!paused) update(dt);
+  // Storage is the browser's business, so the lines update() keeps are saved from here.
+  if (game.splitsDirty) { game.splitsDirty = false; saveSplitsLog(); }
   render();
   requestAnimationFrame(loop);
 }
@@ -6583,6 +6628,69 @@ function pressJump() {
   }
 }
 
+// --- Splits, off the canvas. The strip is pixels, so C puts every kept line on the
+// --- clipboard instead; and the lines are saved, because the obvious way back to the level
+// --- select for another go has always been a reload.
+
+var SPLITS_KEY = 'donkey-yong.splits';
+
+// Behind a try, like everything that touches storage: a private window, a browser that
+// refuses a file:// page its storage, or no storage at all cost the kept lines, and
+// nothing else.
+function loadSplitsLog() {
+  try {
+    var saved = JSON.parse(localStorage.getItem(SPLITS_KEY) || '[]');
+    if (Array.isArray(saved)) {
+      return saved.filter(function (s) { return typeof s === 'string'; }).slice(-SPLITS_KEEP);
+    }
+  } catch (err) { /* nothing kept, then */ }
+  return [];
+}
+
+function saveSplitsLog() {
+  try { localStorage.setItem(SPLITS_KEY, JSON.stringify(game.splitsLog)); } catch (err) { /* ditto */ }
+}
+
+function noteSplits(text) {
+  game.splitsNote = text;
+  game.splitsNoteTimer = 3;
+}
+
+function copySplits() {
+  var n = game.splitsLog.length;
+  if (!n) { noteSplits('NOTHING TO COPY YET -- A SCREEN\'S SPLITS ARE KEPT WHEN IT ENDS'); return; }
+  var text = game.splitsLog.join('\n');
+  var said = function (ok) {
+    if (!ok) console.log(text);
+    noteSplits(ok ? 'COPIED ' + n + (n === 1 ? ' LINE' : ' LINES') + ' OF SPLITS -- PASTE THEM ANYWHERE'
+                  : 'THE BROWSER BLOCKED THE COPY -- THE LINES ARE IN THE CONSOLE');
+  };
+  // The clipboard API where the page is allowed it, and the old textarea trick where not.
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { said(true); },
+                                               function () { said(copyByHand(text)); });
+      return;
+    }
+  } catch (err) { /* fall through to the old way */ }
+  said(copyByHand(text));
+}
+
+function copyByHand(text) {
+  try {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    var ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return !!ok;
+  } catch (err) { return false; }
+}
+
 window.addEventListener('keydown', function (e) {
   if (e.code === 'ArrowLeft' || e.code === 'ArrowRight' ||
       e.code === 'ArrowUp' || e.code === 'ArrowDown' || e.code === 'Space') e.preventDefault();
@@ -6594,6 +6702,10 @@ window.addEventListener('keydown', function (e) {
   if (e.code === 'KeyM') { muted = !muted; }
   if (e.code === 'KeyI' && !e.repeat) { game.invuln = !game.invuln; }
   if (e.code === 'KeyT' && !e.repeat) { game.splitsOn = !game.splitsOn; }
+  if (e.code === 'KeyC' && !e.repeat) copySplits();
+  // Back to the level select from anywhere. A picked screen hands on to the next when it
+  // ends, so without this a second go at the same screen meant a reload.
+  if (e.code === 'Escape' && game.state !== STATE.START && game.state !== STATE.LOADING) toMenu();
 });
 window.addEventListener('keyup', function (e) {
   if (e.code === 'ArrowLeft') keys.left = false;
@@ -6790,6 +6902,8 @@ document.addEventListener('visibilitychange', function () {
 
 // --- Boot. The head photos are required; the stadium photo is optional and the drawn
 // --- stadium stands in for it, so the game never blocks on it.
+
+game.splitsLog = loadSplitsLog();     // the lines kept last time, if the browser allows it
 
 var required = 2;
 var loaded = 0;
