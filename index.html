@@ -358,7 +358,7 @@ var HOLE_Z = 70;
 var HOLE_LANE = Math.round(ROAD_HALF * 0.67);   // lane centres: the dashes are drawn at +-0.34 of the half-width
 
 // The Minis' evasion. Both reactions are bounded so the screen stays finishable, and the
-// bounds are what the bot's "finishes every time" check actually tests.
+// bounds are what the bot's play-through checks actually test.
 //
 //   the dodge: swerve to the far side, slower than Bert can steer, then hold the line
 //   the burst: floor it, slower than Bert cruises, for under a second
@@ -1065,7 +1065,9 @@ var LEVELS = [{
   // the ending. At zero a life goes and the clock resets -- not a hard game over: lives
   // carry across screens, and a bank earned on the Scaffold is not thrown away by one slow
   // drive. The road is 94 seconds at cruise, so the viaduct is reachable only on the boost
-  // and the fight is expected to end around the cutting. That is the pressure. A number,
+  // and the fight was expected to end around the cutting, which was to be the pressure. It
+  // does not: a person meets the gate about 51 s in, by the slender tower, 11,000 units
+  // short and with 39 s in hand, and the bot does the same (NEXT.md, Gate 0). A number,
   // top right, because the player is doing arithmetic against it.
   clock: { secs: 90, per: 'screen', show: 'number' },
   background: drawMancunian,
@@ -1401,6 +1403,8 @@ var game = {
   plunge: null,
   // The screen's hidden extra life has been taken. Once a screen, not once a lap.
   lifeTaken: false,
+  // what the last death was, for the splits -- written by killBert() and nothing else
+  deathCause: null,
   // Hint text: set from the level or from a pickup, ticked down here, worded nowhere but
   // in the data. update() never touches the DOM (invariant 4), so this is plain state.
   hint: null,
@@ -2775,9 +2779,12 @@ function reachGoal() {
   fraudFlees(game.giant);
 }
 
-function killBert() {
+// `cause` is a word for the splits -- 'hole', 'car', 'ball' -- so the line a person pastes
+// says what killed them, not only when. Every death path names one; the harness checks.
+function killBert(cause) {
   if (game.invuln) return;
   game.lives--;
+  game.deathCause = cause || null;
   game.diedThisLevel = true;
   // Whatever he was carrying goes back where it came from. The big hammer is the reason:
   // it never expires and there is only one, so losing it would strand the screen.
@@ -2862,7 +2869,7 @@ function updateCrossing(dt) {
     if (game.levelClock <= 0) {
       game.levelClock = 0;
       if (bert.invincible <= 0) {
-        killBert();
+        killBert('clock');
         if (bert.dying) return;
         // Refused: the alpha invulnerability toggle is on. Start the attempt's clock again,
         // as a respawn would have -- left at zero, this returned every frame before the hop
@@ -2897,17 +2904,17 @@ function updateCrossing(dt) {
         bert.x += car.dir * car.speed * dt;
         // Carried off the edge is a death, not a wall to lean on -- clamping him there
         // would make the far ends of the canal the safest places on the screen.
-        if (bert.x + b.w < 0 || bert.x > WORLD_W) { killBert(); return; }
+        if (bert.x + b.w < 0 || bert.x > WORLD_W) { killBert('carried'); return; }
       } else if (bert.invincible <= 0) {
         sfx.ballBurst();
-        killBert();
+        killBert('water');
         return;
       }
     } else if (row.kind === 'road' && bert.invincible <= 0) {
       for (var v = 0; v < game.traffic.length; v++) {
         var veh = game.traffic[v];
         if (veh.kind !== 'car' || veh.row !== bert.row) continue;
-        if (overlaps(b, veh)) { killBert(); return; }
+        if (overlaps(b, veh)) { killBert('car'); return; }
       }
     }
     if (bert.row === 0 && game.giant && !game.giant.escaping &&
@@ -2984,10 +2991,10 @@ function updateConcourse(dt) {
             spawnGiant(true);
             showHint(HINTS.cornered);
           }
-        } else if (bert.invincible <= 0) { killBert(); return; }
+        } else if (bert.invincible <= 0) { killBert('mini'); return; }
       } else if (bert.powered > 0 && level.boss.routedBy === 'powered') {
         fraudFlees(f);
-      } else if (level.boss.contactDamage && bert.invincible <= 0) { killBert(); return; }
+      } else if (level.boss.contactDamage && bert.invincible <= 0) { killBert('giant'); return; }
     }
   }
 
@@ -3050,7 +3057,7 @@ function tickClock(dt) {
   game.levelClock = clockSecs();
   if (game.state === STATE.PLAYING) {
     showHint(HINTS.clock);
-    kartFalls();
+    kartFalls('clock');
   }
 }
 
@@ -3062,7 +3069,7 @@ function kartAirRise() {
 
 // Off the deck. There is nothing under the Mancunian Way but Manchester -- which is
 // geographically true, and is why this screen kills the way it does.
-function kartFalls() {
+function kartFalls(cause) {
   if (game.invuln) {
     // An invulnerable run still has to be playable. Left hanging over the drop there is
     // nowhere for the screen to continue from, so he goes back on the centreline.
@@ -3072,7 +3079,7 @@ function kartFalls() {
     return;
   }
   bert.falling = true;
-  killBert();
+  killBert(cause);
 }
 
 // Returns true when the caller must stop: he has just died, and the frame is over.
@@ -3116,7 +3123,7 @@ function updateKartBert(dt) {
   // A sinkhole. In the air you clear it, as you clear everything else under you.
   if (bert.air <= 0 && !bert.dying && holeUnder(bert.roadX, z)) {
     showHint(HINTS.sinkhole);
-    kartFalls();
+    kartFalls('hole');
     return true;
   }
   // The extra life, if it is here and he is where it is -- which is over the drop, so in
@@ -3137,7 +3144,7 @@ function updateKartBert(dt) {
       bert.air = 0;
       // You land on whatever is under you when the hop runs out, and that is the whole
       // bargain the ramp offers.
-      if (offDeck(bert.roadX, z)) { kartFalls(); return true; }
+      if (offDeck(bert.roadX, z)) { kartFalls('drop'); return true; }
       sfx.stomp();
     }
   } else if (bert.onSlip && beyondMain && slipWidth(z) <= 0) {
@@ -3147,7 +3154,7 @@ function updateKartBert(dt) {
     showHint(HINTS.ramp);
     sfx.jump();
   } else if (offDeck(bert.roadX, z)) {
-    kartFalls();
+    kartFalls('edge');
     return true;
   }
   bert.onSlip = slipWidth(z) > 0 && beyondMain;
@@ -3358,7 +3365,7 @@ function updateKartBalls(dt) {
       if (bert.dying || bert.air > 0 || bert.invincible > 0) continue;
       if (Math.abs(b.z - z) < KART_BALL_Z && Math.abs(b.roadX - bert.roadX) < KART_BALL_X) {
         game.balls.splice(i, 1);
-        killBert();
+        killBert('ball');
         return true;
       }
     } else {
@@ -3577,7 +3584,7 @@ function updatePlatformer(dt) {
         if (fr.type === 'giant' && level.boss.contactDamage === false) {
           // Deliberately nothing: a boss who cannot be fought cannot kill you either.
         } else if (bert.invincible <= 0) {
-          killBert();
+          killBert(fr.type);
           break;
         }
       }
@@ -3588,7 +3595,7 @@ function updatePlatformer(dt) {
     for (var q = 0; q < game.balls.length; q++) {
       if (ballHitsBert(game.balls[q])) {
         game.balls.splice(q, 1);
-        killBert();
+        killBert('ball');
         break;
       }
     }
@@ -3599,7 +3606,7 @@ function updatePlatformer(dt) {
       var rl = game.rollers[rr];
       if (!circleHitsBody(rl.x, rl.y, ROLLER_R, bert)) continue;
       // Smashing one is the swing's job, above. Reaching the body means it got past him.
-      if (bert.invincible <= 0) { killBert(); break; }
+      if (bert.invincible <= 0) { killBert('roller'); break; }
     }
   }
 
@@ -3732,7 +3739,7 @@ function watchSplits(dt) {
   // cards, which last the same whoever is playing.
   if (st === STATE.PLAYING || st === STATE.RESPAWNING) game.levelTime += dt;
   var mark = function (label) { game.splits.push({ label: label, t: game.levelTime }); };
-  if (game.lives < w.lives) mark('died');
+  if (game.lives < w.lives) mark(game.deathCause ? 'died:' + game.deathCause : 'died');
   else if (game.lives > w.lives) mark('+life');
   if (game.minisLeft < w.minis) mark('m' + (w.minis0 - game.minisLeft));
   if (game.giantSpawned && !w.giant) mark('G');
